@@ -1,0 +1,246 @@
+---
+title: "Full 7q22 Output Data Preparation and Preliminary Investigation"
+author: "Edward Plugge"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    df_print: paged
+    toc: yes
+  pdf_document:
+    toc: yes
+Date: 26.05.2020
+---
+
+This document details the steps taken after local SNP-to-metabolite analysis of the 7q22 locus has been performed and the 34 output files have been cleaned (comments removed) The purpose is to impose a cutoff for low MAF SNPs; to excluding alleles with a MAF threshold that is based upon stratified QQ plots. Finally, the data can be preliminarily visualised with local manhattan plots in order for further investigation to be performed. The resulting file "listcopy" contains the initial statistics that can be exported for input into more powerful web-tool based regional association plotting tools, such as SNiPA.com: https://snipa.helmholtz-muenchen.de/snipa3/?task=regional_association_plot
+
+# Chapter 1: Setup 
+```{r setup, include=TRUE}
+# Define working dir and load packages
+ROOT_loc = "/Users/edwardplugge/Documents/UMC/UCORBIO/Full 7Q22 Output"
+INPUT_loc = paste0(ROOT_loc,"/Input")
+OUTPUT_loc = paste0(ROOT_loc,"/Output")
+PLOT_loc = paste0(ROOT_loc,"/Plots")
+
+setwd(paste0(ROOT_loc))
+
+library(tidyverse)
+library(stringr)
+library(CMplot)
+library(data.table)
+library(fdrtool)
+library(qvalue)
+library(RACER)
+
+```
+
+# Chapter 2: Importing, listing, cleaning and preparing SNPTEST output files for plot generation
+
+The chosen phenotypes must be listed as they are written in the SNPTEST output files
+```{r define 34 phenotypes, include=TRUE}
+# Define the list of phenotypes 
+phenotypes <- c("Ala_Z", "ApoA1_Z", "ApoB_ratio_ApoA1_Z", "ApoB_Z", "Crea_Z",
+                "EstC_Z", "FAw3_Z", "FAw6_Z", "FreeC_Z", "Gln_Z", "IDL_P_Z",
+                "L_HDL_P_Z", "L_LDL_P_Z", "L_VLDL_P_Z", "LA_Z", "Leu_Z",
+                "M_HDL_P_Z", "M_LDL_P_Z", "M_VLDL_P_Z", "MUFA_Z", "PC_Z",
+                "PUFA_Z", "S_HDL_P_Z", "S_LDL_P_Z", "S_VLDL_P_Z", "Serum_C_Z",
+                "Serum_TG_Z", "SFA_Z", "TotFA_Z", "TotPG_Z", "XL_HDL_P_Z",
+                "XL_VLDL_P_Z", "XS_VLDL_P_Z", "XXL_VLDL_P_Z")
+
+```
+
+The data import can then be automated, as well as the cleaning of some unwanted results. N.B. this chunk writes .txt output files for each phenotype that can be read into the plot chunk below. The region analysed is Chr7:106500000-107650000 (for Build GRCHh37.p13)
+
+```{r data import, include=TRUE}
+temp = list.files(paste0(INPUT_loc), pattern="*.jobarray.out")
+list = lapply(paste0(INPUT_loc,"/",temp), function(i){
+  read.csv(i, header=TRUE, sep = " ")
+})
+```
+
+```{r text file export, include=TRUE}
+
+data=list()
+for(i in 1:length(list)){
+list[[i]] <- list[[i]] %>% 
+  filter(!grepl('frequentist_add:model_not_fit:design_matrix_singular_value_below_limit', comment))
+data[[i]] <- subset(list[[i]], select = c("frequentist_add_pvalue", "all_maf", "info"))
+names(data[[i]])[names(data[[i]]) == "frequentist_add_pvalue"] <- "P"
+names(data[[i]])[names(data[[i]]) == "all_maf"] <- "CAF"
+names(data[[i]])[names(data[[i]]) == "info"] <- "INFO"
+fwrite(data[[i]], file = paste0(OUTPUT_loc, "/", paste0(phenotypes[[i]],"_plot.txt")), col.names = TRUE, sep = " ")
+}
+
+# Copy list for redundancy, so import doesn't have to be repeated
+
+listcopy <- list
+```
+
+# Chapter 3: Summarising initial data with descriptive statistics and QQ plots
+
+The general statistics of each MAF can then be summarised 
+```{r summarise, include=TRUE}
+MAFlist = lapply(listcopy, function(x) x%>% select(19))
+sapply(MAFlist, summary)
+```
+
+This chunk runs the plot_gwas.R command which is configured to produce a stratified QQplot png for each phenotype. To change the plot content the .txt file must be re-written. This chunk may take some time. 
+```{r plot generation, include=TRUE}
+for(i in phenotypes){
+system(paste0("R CMD BATCH -",i,"_plot.txt -",i,".out plot_gwas.R"))
+}
+```
+
+Two examples of stratified QQ plots are shown
+
+
+![SNP-to-Large LDL](L_LDL_P_Z.out.qqplot_maf.png) 
+
+
+![SNP-to-ApoB](ApoB_Z.out.qqplot_maf.png) 
+
+The pattern acrosss the majority of plots demonstrates that SNPs with a MAF < 0.01, and to a degree between 0.01 and 0.05 show significant early separation of the observed from the expected, as well as a overwhelming skewing effect on the average plotted values across all MAF levels (shown in black under "observed"). Therefore the original lists must be subjected to a MAF cutoff based on a determined threshold that reflects this. 
+```{r MAF filtration, include=TRUE}
+# Filters MAF in all dfs in list based on selected value
+listcopy = lapply(listcopy, function(df) {
+  filter(df, all_maf > 0.05)
+})
+```
+
+# Chapter 4: Correcting for Type I errors with CMT - Correction for Multiple Testing
+
+First we can inspect the descriptives statistics of the P-value for each metabolite. 
+```{r P value Descriptive Statistics, include=TRUE}
+# Extract P value from output data frame
+Pvaluelist = lapply(listcopy, function(x) x%>% select(2:4,22))
+# Create name for all columns
+colnames <- c("SNP","chr","pos","pvalue")
+# Assign name to each data frame
+Pvaluelist <- lapply(Pvaluelist, setNames, colnames)
+# Rename Columns
+names(Pvaluelist) <- c(paste0(phenotypes))
+# Provide a summary
+#sapply(Pvaluelist, summary(pvalue))
+```
+
+```{r Deciding N}
+# Find the average number of SNPs tested across all metabolites
+number.of.tests <- sapply(list, nrow)
+
+# Bonferroni correction: Finding alpha for
+
+alpha <- 0.05/print(mean(number.of.tests))
+print(alpha)
+```
+
+A quick investigation of correlation within metabolites reveals groups with similar patterns:
+
+![7Q22 Metabolite Correlation Plot](7Q22 Metabolite Correlation Plot copy.png) 
+
+The above correlation plot shows the correlation between all 34 metabolites ordered by heirarchical cluster to reveal a simple measure of substructure of similarity in the groups. 
+
+As expected, subgroups of the same, or very similar lipiprotein fraction are generally positively correlated with eachother, since the 14 classes are can broadly be distinguished from eachother based on a continous scale of decreasing size and increasing density, from XXL VLDL (Extremely large very-low-density lipoprotein, to XS HDL (extremely small high-density lipoprotein). 
+
+From the graph we can assume Leucine, Alanine, Glycine, and Omega-3-Fatty-Acids levels to not be significantly correlated with any other metabolite. This leaves three distinct groups in which the metabolites show a correlation of between 0.8-1.
+
+This leaves 8 groups of tests that we can assume to be independant. So the alpha value adjusted for the number of (assumed) independant SNP-to-Metabolite tests of association, and adjustedd for the number of independant metabolite groups are as such:
+
+
+```{r bonferroni, include=FALSE}
+# Create the alpha value depreciated by both the number of independant tests, and the number of independant metabolite groups
+alpha <- (0.05/print(mean(number.of.tests))/8)
+# Print alpha
+print(alpha)
+```
+```{r Example Bonferroni Adjustment filtration }
+# Filters Pvalues in all dfs in list based on selected value
+BonferroniList = lapply(Pvaluelist, function(df) {
+  filter(df, pvalue < print(alpha))
+})
+```
+
+# Chapter 5: Correcting for FWER: Family wise error rate with FDR (False discovery rate)
+
+The false discovery rate (FDR) is the expected proportion of false rejections out of all rejections.This chunk prepares the data for an FWER later on. The FWER method is preferred in place of the above described bonferroni method in the case of assumed independance and a need for a less conservative correction tool. 
+
+```{r FDR, include=TRUE}
+
+# False Discovery Rate for Ala
+
+Qobjectlist = lapply(Pvaluelist, function(df) {
+  qobj = qvalue(p = df$pvalue)
+  return(qobj)
+})
+
+# Once the qvalue object is created, estimates of the q-values, the proportion of true null hypotheses, 
+# and the local false discovery rates can be accessed from qobj:
+  
+```
+
+N.B. The intitial input file contains over 3000 tests performed. After trimming for maf <0.05 this leaves 1500 remaining. Here, these results can be visualised before further investigation. 
+```{r FDRhist, include=TRUE}
+
+##Options for visualising results
+#summary(Pvaluelist$ApoB_Z)
+
+#hist(Pvaluelist$L_LDL_P_Z)
+
+#plot(qobj)
+
+## Options for visualising histograms and summary stats for a specified output result, in rhis case IDL
+
+#hist(-log10(Qobjectlist$IDL_P_Z$pvalue))
+
+#summary(Qobjectlist$IDL_P_Z)
+
+#plot(Qobjectlist$IDL_P_Z)
+
+#hist(Qobjectlist$IDL_P_Z)
+
+```
+
+The resulting files can then be plotting using the CMPLOT package to investigation regional associations to metabolites. These plots are not adjusted for multiple testing and aren't shown. 
+```{r CMPLOT, include = FALSE}
+
+lapply(Pvaluelist, function(df) {
+CMplot(df,type="p",plot.type="m",LOG10=TRUE,threshold=NULL,file="jpg",memo="",dpi=300,
+    file.output=FALSE,verbose=TRUE,width=14,height=6,chr.labels.angle=45)
+})
+```
+
+
+Only the phenotypes with significant hits have been isolated here. The FWER method may be selected, though here it is "holm". 
+```{r lapply}
+Qvaluelist2 = lapply(Pvaluelist, function(input) {
+  q <- p.adjust(input$pvalue, method = "holm")
+  q <- as.data.frame(q)
+  qout <- cbind(input[1:3],q)
+  qout
+})
+
+# Significant phenotypes have been isolated for further study here. 
+sig_phenotypes <- phenotypes[c(4,6,8,9,11,13,15,18,22,24,26,33)]
+
+for (i in sig_phenotypes) {
+  df = Qvaluelist2[[i]]
+  CMplot(df,type="p",plot.type="m",main=sprintf("%s - Holm", i), LOG10=TRUE,file="jpg",memo="",dpi=300,
+       file.output=FALSE,verbose=TRUE,width=14,height=6,chr.labels.angle=45)
+}
+```
+
+These plots demonstrate a locus at 107.5 Mbp showing a region (likely in high LD) with significant variants for each phenotype depicted, after correction for multiple testing. These should be investigated further. 
+
+P.S. For further investigation, a SNP (base pair location format as shown below) may be highlighted here to investigate loci of interest. Alternatively, SNPs below and above a certain p-value can be isolated, which is especially useful when using the HOLM correction method which assigns non-significant values as q=1
+
+```{r SNP highlighting}
+IDL<- Qvaluelist2$IDL_P_Z
+SNP <- IDL[IDL$q < 0.05, 1]
+SNPrs <- as.character("7:107091849")
+
+#geneSNPs <- 
+#genes <- paste("COG5", 1:length(geneSNPs), sep="_")
+#rm(IDL,SNP)
+```
+
+Once a preliminary investigation is done, the original files in "listcopy" can be trimmed and imported into https://snipa.helmholtz-muenchen.de/snipa3/?task=regional_association_plot or any preferred tool where more powerful and interactive regional association plots can be made. Input file formats differ for each tool and are not described here. 
